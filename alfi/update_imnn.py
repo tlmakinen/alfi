@@ -9,9 +9,15 @@ import flax.linen as nn
 
 import jax.random as jr
 
+import cloudpickle as pickle
+
+
+np = jnp
 
 from imnns import _check_input
+from functools import partial
 from progress_bar import *
+from imnns import *
 
 
 class _updateIMNN:
@@ -348,9 +354,11 @@ class _updateIMNN:
         if w is None:
             w = self.w
         if validate:
-            self.summs_t = self.summaries_t[self.n_s:]
+            if self.existing_statistic is not None:
+                self.summs_t = self.summaries_t[self.n_s:]
         else:
-            self.summs_t = self.summaries_t[:self.n_s]
+            if self.existing_statistic is not None:
+                self.summs_t = self.summaries_t[:self.n_s]
         summaries, derivatives = self.get_summaries(
             w=w, key=key, validate=validate)
         return self._calculate_F_statistics(summaries, derivatives)
@@ -422,7 +430,12 @@ class _updateIMNN:
             F = np.einsum("ij,ik,kl->jl", dμ_dθ, invC, dμ_dθ)
             F_network = np.einsum("ij,ik,kl->jl", dμ_dθ, invC_loss, dμ_dθ)
             Cfull = C
-
+            detFnew = self._slogdet(F)
+            u = None
+            Λ_info = None
+            Σ = None
+            invΣ = None
+            dμ_dθ_full = dμ_dθ
         
         return (F, C, invC, dμ_dθ, μ, F_network, detFnew, u, Λ_info, Σ, invΣ, Cfull, dμ_dθ_full)
 
