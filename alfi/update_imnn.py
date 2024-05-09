@@ -6,7 +6,7 @@ import optax
 import matplotlib.pyplot as plt
 from functools import partial
 import flax.linen as nn
-
+import netket as nk
 import jax.random as jr
 
 import cloudpickle as pickle
@@ -878,3 +878,202 @@ class NoiseNumericalGradientIMNN(_updateIMNN):
         """
         return np.swapaxes(x_mp[:, 1] - x_mp[:, 0], 1, 2) / self.δθ
 
+# NOISE NUMERICAL GRADIENT IMNN
+class batchedNoiseNumericalGradientIMNN(_updateIMNN):
+    """Information maximising neural network fit with simulations on-the-fly
+    """
+    def __init__(self, n_s, n_d, n_params, n_summaries, input_shape, θ_fid, δθ,
+                 model, optimiser, key_or_state,
+                 noise_simulator, 
+                 fiducial, derivative,
+                 chunk_size=100,
+                 validation_fiducial=None, validation_derivative=None, 
+                 existing_statistic=None,
+                 dummy_graph_input=None,
+                 no_invC=False, do_reg=True,
+                 evidence=False):
+        """Constructor method
+
+        Initialises all IMNN attributes, constructs neural network and its
+        initial parameter values and creates history dictionary. Also checks
+        validity of simulator and sets the ``simulate`` attribute to ``True``.
+
+        Parameters
+        ----------
+        n_s : int
+            Number of simulations used to calculate summary covariance
+        n_d : int
+            Number of simulations used to calculate mean of summary derivative
+        n_params : int
+            Number of model parameters
+        n_summaries : int
+            Number of summaries, i.e. outputs of the network
+        input_shape : tuple
+            The shape of a single input to the network
+        θ_fid : float(n_params,)
+            The value of the fiducial parameter values used to generate inputs
+        model : tuple, len=2
+            Tuple containing functions to initialise neural network
+            ``fn(rng: int(2), input_shape: tuple) -> tuple, list`` and the
+            neural network as a function of network parameters and inputs
+            ``fn(w: list, d: float(None, input_shape)) -> float(None, n_summari
+            es)``.
+            (Essentibly stax-like, see `jax.experimental.stax <https://jax.read
+            thedocs.io/en/stable/jax.experimental.stax.html>`_))
+        optimiser : tuple, len=3
+            Tuple containing functions to generate the optimiser state
+            ``fn(x0: list) -> :obj:state``, to update the state from a list of
+            gradients ``fn(i: int, g: list, state: :obj:state) -> :obj:state``
+            and to extract network parameters from the state
+            ``fn(state: :obj:state) -> list``.
+            (See `jax.experimental.optimizers <https://jax.readthedocs.io/en/st
+            able/jax.experimental.optimizers.html>`_)
+        key_or_state : int(2) or :obj:state
+            Either a stateless random number generator or the state object of
+            an preinitialised optimiser
+        simulator : fn
+            A function that generates a single simulation from a random number
+            generator and a tuple (or array) of parameter values at which to
+            generate the simulations. For the purposes of use in LFI/ABC
+            afterwards it is also useful for the simulator to be able to
+            broadcast to a batch of simulations on the zeroth axis
+            ``fn(int(2,), float([None], n_params)) ->
+            float([None], input_shape)``
+        dummy_graph_input : jraph.GraphsTuple or 'jax.numpy.DeviceArray'
+            Either a (padded) graph input or device array. If supplied ignores 
+            `input_shape` parameter
+        """
+        super().__init__(
+            n_s=n_s,
+            n_d=n_d,
+            n_params=n_params,
+            n_summaries=n_summaries,
+            input_shape=input_shape,
+            θ_fid=θ_fid,
+            model=model,
+            optimiser=optimiser,
+            key_or_state=key_or_state,
+            existing_statistic=existing_statistic,
+            dummy_graph_input=dummy_graph_input,
+            no_invC=no_invC,
+            do_reg=do_reg,
+            evidence=evidence)
+
+        self.chunk_size = chunk_size
+        self.existing_statistic = existing_statistic
+        self.simulator = noise_simulator
+        #self.simulate = True
+        self.dummy_graph_input = dummy_graph_input
+        self.θ_der = (θ_fid + np.einsum("i,jk->ijk", np.array([-1., 1.]), 
+                                        np.diag(δθ) / 2.)).reshape((-1, 2))
+        self.δθ = np.expand_dims(
+            _check_input(δθ, (self.n_params,), "δθ"), (0, 1))
+        
+        # NUMERICAL GRADIENT SETUP
+        self._set_data(δθ, fiducial, derivative, validation_fiducial,
+                       validation_derivative)
+
+
+    def _set_data(self, δθ, fiducial, derivative, validation_fiducial,
+                  validation_derivative):
+        """Checks and sets data attributes with the correct shape
+        """
+        self.δθ = np.expand_dims(
+            _check_input(δθ, (self.n_params,), "δθ"), (0, 1))
+        if self.dummy_graph_input is None:
+          self.fiducial = _check_input(
+              fiducial, (self.n_s,) + self.input_shape, "fiducial")
+          self.derivative = _check_input(
+              derivative, (self.n_d, 2, self.n_params) + self.input_shape,
+              "derivative")
+          if ((validation_fiducial is not None)
+                  and (validation_derivative is not None)):
+              self.validation_fiducial = _check_input(
+                  validation_fiducial, (self.n_s,) + self.input_shape,
+                  "validation_fiducial")
+              self.validation_derivative = _check_input(
+                  validation_derivative,
+                  (self.n_d, 2, self.n_params) + self.input_shape,
+                  "validation_derivative")
+              self.validate = True
+        else:
+          self.fiducial = fiducial
+          self.derivative = derivative
+
+          if ((validation_fiducial is not None)
+                  and (validation_derivative is not None)):
+              self.validation_fiducial = validation_fiducial
+              self.validation_derivative =  validation_derivative
+              self.validate = True
+
+
+    def _collect_input(self, key, validate=False):
+        """ Returns validation or fitting sets
+        """
+        if validate:
+            fiducial = self.validation_fiducial
+            derivative = self.validation_derivative
+        else:
+            fiducial = self.fiducial
+            derivative = self.derivative
+            
+        # add noise to data and make cuts
+        keys = np.array(jax.random.split(key, num=self.n_s))
+        fiducial = jax.vmap(self.simulator)(keys, fiducial)
+        
+        _shape = derivative.shape
+        derivative = jax.vmap(self.simulator)(
+                np.repeat(keys[:self.n_d], 2*self.n_params, axis=0),
+                derivative.reshape(
+                      (self.n_d * 2 * self.n_params,) + self.input_shape)).reshape(_shape)
+                      
+        return fiducial, derivative
+
+    def _get_fitting_keys(self, rng):
+        """Generates random numbers for simulation
+
+        Parameters
+        ----------
+        rng : int(2,)
+            A random number generator
+
+        Returns
+        -------
+        int(2,), int(2,), int(2,)
+            A new random number generator and random number generators for
+            fitting (and validation)
+        """
+        return jax.random.split(rng, num=3)
+
+    def get_summaries(self, w, key=None, validate=False):
+        """Gets all network outputs and derivatives wrt model parameters
+        """
+        d, d_mp = self._collect_input(key, validate=validate)
+        
+        
+        if self.dummy_graph_input is None:
+          _model = lambda d: self.model(w, d)
+          # try the netket batched vmap
+          # nk.jax.vmap_chunked(f, in_axes=0, *, chunk_size, axis_0_is_sharded=False)
+          x = nk.jax.vmap_chunked(_model, chunk_size=self.chunk_size)(d)
+          x_mp = np.reshape(
+              nk.jax.vmap_chunked(_model, chunk_size=self.chunk_size)(
+                    d_mp.reshape(
+                      (self.n_d * 2 * self.n_params,) + self.input_shape)),
+              (self.n_d, 2, self.n_params, self.n_summaries))
+
+        else:
+          # if operating on graph data, we need to vmap the implicit
+          # batch dimension
+          _model = lambda d: self.model(w, d)
+          x = jax.vmap(_model)(d)
+          x_mp = np.reshape(
+              jax.vmap(_model)(d_mp),
+              (self.n_d, 2, self.n_params, self.n_summaries))
+
+        return x, x_mp
+
+    def _construct_derivatives(self, x_mp):
+        """Builds derivatives of the network outputs wrt model parameters
+        """
+        return np.swapaxes(x_mp[:, 1] - x_mp[:, 0], 1, 2) / self.δθ
